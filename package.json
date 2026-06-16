@@ -1,0 +1,6 @@
+{
+  "name": "toke-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Canonical TOKE API at api.mctoken.xyz/v1 — live oracle + proxy to the explorer static contract."
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { "source": "/v1/oracle", "destination": "/api/oracle" },
+    { "source": "/v1", "destination": "https://explorer.mctoken.xyz/api/v1/index.json" },
+    { "source": "/v1/(.*)", "destination": "https://explorer.mctoken.xyz/api/v1/$1" },
+    { "source": "/", "destination": "https://explorer.mctoken.xyz/api/v1/index.json" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "access-control-allow-origin", "value": "*" },
+        { "key": "access-control-allow-methods", "value": "GET,OPTIONS" }
+      ]
+    }
+  ]
+}
