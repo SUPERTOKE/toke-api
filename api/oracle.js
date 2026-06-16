@@ -44,6 +44,10 @@ export default async function handler(req, res) {
     }
     const price = liq ? priceWeighted / liq : +(pairs[0] || {}).priceUsd || 0;
 
+    // 24h price change from the deepest-liquidity pair (DexScreener)
+    const topPairChange = Number((pairs[0] || {})?.priceChange?.h24);
+    const price_change_h24 = Number.isFinite(topPairChange) ? topPairChange : null;
+
     // implied mcap from the canonical TOKE API supply (single source of truth)
     let supply = null;
     try {
@@ -65,6 +69,7 @@ export default async function handler(req, res) {
     return res.status(200).json(
       envelope({
         liquidity_weighted_price_usd: price,
+        price_change_h24: price_change_h24,
         total_pool_liquidity_usd: Math.round(liq * 100) / 100,
         implied_mcap_usd: implied_mcap_usd != null ? Math.round(implied_mcap_usd) : null,
         supply_used: supply,
