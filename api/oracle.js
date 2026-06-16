@@ -3,6 +3,8 @@
 // implied market cap from the canonical TOKE API supply. Same envelope shape as the
 // rest of the TOKE API contract so consumers (mctoken.xyz site + explorer) are uniform.
 
+import { recordAndDeltas } from '../lib/snap.js';
+
 const MINT = process.env.TOKE_MINT || 'AmgUMQeqW8H74trc8UkKjzZWtxBdpS496wh4GLy2mCpo';
 const STATIC_BASE = (process.env.STATIC_BASE || 'https://explorer.mctoken.xyz/api/v1').replace(/\/+$/, '');
 
@@ -66,6 +68,22 @@ export default async function handler(req, res) {
         ? price * supply
         : null;
 
+    // canonical holder count (for the holders 24h delta) from the TOKE API
+    let holders = null;
+    try {
+      const h = await fetch(`${STATIC_BASE}/_lean_stats.json`, { headers: { Accept: 'application/json' } });
+      if (h.ok) {
+        const hj = await h.json();
+        const n = Number(hj?.holders);
+        if (Number.isFinite(n) && n > 0) holders = n;
+      }
+    } catch {
+      /* non-fatal */
+    }
+
+    // record an hourly snapshot + compute 24h deltas (no-op until a KV is configured + ~24h warm-up)
+    const deltas = await recordAndDeltas({ price, liq, mcap: implied_mcap_usd, holders });
+
     return res.status(200).json(
       envelope({
         liquidity_weighted_price_usd: price,
@@ -73,6 +91,10 @@ export default async function handler(req, res) {
         total_pool_liquidity_usd: Math.round(liq * 100) / 100,
         implied_mcap_usd: implied_mcap_usd != null ? Math.round(implied_mcap_usd) : null,
         supply_used: supply,
+        holders,
+        liquidity_change_pct_24h: deltas.liquidity_change_pct_24h ?? null,
+        holders_change_24h: deltas.holders_change_24h ?? null,
+        mcap_change_pct_24h: deltas.mcap_change_pct_24h ?? null,
         method: 'live liquidity-weighted VWAP (DexScreener); mcap = price × TOKE-API supply',
         pools: pairs.map((p) => ({
           dex: p.dexId,
