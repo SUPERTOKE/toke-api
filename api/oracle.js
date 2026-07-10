@@ -39,10 +39,12 @@ export default async function handler(req, res) {
 
     let liq = 0;
     let priceWeighted = 0;
+    let vol24 = 0;
     for (const p of pairs) {
       const L = +p.liquidity.usd || 0;
       liq += L;
       priceWeighted += (+p.priceUsd || 0) * L;
+      vol24 += +(p.volume && p.volume.h24) || 0;
     }
     const price = liq ? priceWeighted / liq : +(pairs[0] || {}).priceUsd || 0;
 
@@ -89,6 +91,7 @@ export default async function handler(req, res) {
         liquidity_weighted_price_usd: price,
         price_change_h24: price_change_h24,
         total_pool_liquidity_usd: Math.round(liq * 100) / 100,
+        total_volume_h24_usd: Math.round(vol24 * 100) / 100,
         implied_mcap_usd: implied_mcap_usd != null ? Math.round(implied_mcap_usd) : null,
         supply_used: supply,
         holders,
