@@ -37,19 +37,29 @@ export default async function handler(req, res) {
       .filter((p) => p.liquidity && +p.liquidity.usd > 0)
       .sort((a, b) => +b.liquidity.usd - +a.liquidity.usd);
 
+    // ⚠️ DexScreener's token endpoint returns pairs where TOKE is base OR quote. For
+    // quote-side pairs (e.g. DANK/TOKE) `priceUsd` is the BASE token's price, NOT TOKE's —
+    // blending those into the VWAP silently skews the published TOKE price. Price therefore
+    // uses base-side pairs only; liquidity + volume still sum across ALL pairs (ecosystem-wide).
+    const basePairs = pairs.filter((p) => p.baseToken && p.baseToken.address === MINT);
+
     let liq = 0;
-    let priceWeighted = 0;
     let vol24 = 0;
     for (const p of pairs) {
-      const L = +p.liquidity.usd || 0;
-      liq += L;
-      priceWeighted += (+p.priceUsd || 0) * L;
+      liq += +p.liquidity.usd || 0;
       vol24 += +(p.volume && p.volume.h24) || 0;
     }
-    const price = liq ? priceWeighted / liq : +(pairs[0] || {}).priceUsd || 0;
+    let priceLiq = 0;
+    let priceWeighted = 0;
+    for (const p of basePairs) {
+      const L = +p.liquidity.usd || 0;
+      priceLiq += L;
+      priceWeighted += (+p.priceUsd || 0) * L;
+    }
+    const price = priceLiq ? priceWeighted / priceLiq : +(basePairs[0] || pairs[0] || {}).priceUsd || 0;
 
-    // 24h price change from the deepest-liquidity pair (DexScreener)
-    const topPairChange = Number((pairs[0] || {})?.priceChange?.h24);
+    // 24h price change from the deepest-liquidity BASE pair (DexScreener)
+    const topPairChange = Number((basePairs[0] || {})?.priceChange?.h24);
     const price_change_h24 = Number.isFinite(topPairChange) ? topPairChange : null;
 
     // implied mcap from the canonical TOKE API supply (single source of truth)
@@ -98,11 +108,13 @@ export default async function handler(req, res) {
         liquidity_change_pct_24h: deltas.liquidity_change_pct_24h ?? null,
         holders_change_24h: deltas.holders_change_24h ?? null,
         mcap_change_pct_24h: deltas.mcap_change_pct_24h ?? null,
-        method: 'live liquidity-weighted VWAP (DexScreener); mcap = price × TOKE-API supply',
+        method: 'live liquidity-weighted VWAP over TOKE-base pairs (DexScreener); liquidity/volume summed over all pairs; mcap = price × TOKE-API supply',
         pools: pairs.map((p) => ({
           dex: p.dexId,
+          base: p.baseToken && p.baseToken.symbol,
           quote: p.quoteToken && p.quoteToken.symbol,
           priceUsd: +p.priceUsd,
+          in_vwap: !!(p.baseToken && p.baseToken.address === MINT),
           liquidityUsd: +p.liquidity.usd,
           cite: { type: 'account', ref: p.pairAddress }
         }))
