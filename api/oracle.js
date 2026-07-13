@@ -3,10 +3,16 @@
 // implied market cap from the canonical TOKE API supply. Same envelope shape as the
 // rest of the TOKE API contract so consumers (mctoken.xyz site + explorer) are uniform.
 
-import { recordAndDeltas } from '../lib/snap.js';
+import { recordAndDeltas, getLastGood, setLastGood } from '../lib/snap.js';
 
 const MINT = process.env.TOKE_MINT || 'AmgUMQeqW8H74trc8UkKjzZWtxBdpS496wh4GLy2mCpo';
 const STATIC_BASE = (process.env.STATIC_BASE || 'https://explorer.mctoken.xyz/api/v1').replace(/\/+$/, '');
+// Degraded-upstream guard: a pool from the canonical registry (pools.json) with at
+// least this much liquidity at last build must appear in DexScreener's response,
+// otherwise the response is treated as degraded and last-good is served instead.
+// (2026-07-13: DexScreener dropped the largest pool from responses to Vercel's egress.)
+const GUARD_MIN_LIQ_USD = Number(process.env.ORACLE_GUARD_MIN_LIQ_USD) || 1000;
+const GUARD_ENABLED = process.env.ORACLE_GUARD !== '0';
 
 export default async function handler(req, res) {
   res.setHeader('access-control-allow-origin', '*');
@@ -42,6 +48,49 @@ export default async function handler(req, res) {
     // blending those into the VWAP silently skews the published TOKE price. Price therefore
     // uses base-side pairs only; liquidity + volume still sum across ALL pairs (ecosystem-wide).
     const basePairs = pairs.filter((p) => p.baseToken && p.baseToken.address === MINT);
+
+    // --- degraded-upstream guard -------------------------------------------
+    // Cross-check the pair list against the canonical pool registry. If a major
+    // known pool is missing, DexScreener is serving us a degraded view: publish
+    // the last known-good payload (flagged) rather than skewed numbers, and do
+    // NOT record the degraded values into the 24h delta buckets.
+    let missingPools = [];
+    if (GUARD_ENABLED) {
+      try {
+        const pr = await fetch(`${STATIC_BASE}/pools.json`, { headers: { Accept: 'application/json' } });
+        if (pr.ok) {
+          const pj = await pr.json();
+          const registry = Array.isArray(pj?.data) ? pj.data : [];
+          const seen = new Set(pairs.map((p) => p.pairAddress));
+          missingPools = registry
+            .filter((p) => p && p.pair && Number(p.liquidity_usd) >= GUARD_MIN_LIQ_USD && !seen.has(p.pair))
+            .map((p) => p.pair);
+        }
+      } catch {
+        /* registry unreachable → guard can't judge; proceed live */
+      }
+    }
+    if (missingPools.length > 0) {
+      const lastGood = await getLastGood();
+      if (lastGood && lastGood.data) {
+        // serve last-good, honestly labeled; envelope as_of stays "now",
+        // data_as_of says how old the numbers actually are
+        return res.status(200).json(
+          envelope(lastGood.data, {
+            source: {
+              live: 'dexscreener',
+              degraded: true,
+              served: 'last_good',
+              data_as_of: lastGood.as_of || null,
+              missing_pools: missingPools
+            }
+          })
+        );
+      }
+      // no last-good available: fall through and publish live numbers, but the
+      // response is flagged and the delta buckets are protected below.
+    }
+    const degraded = missingPools.length > 0;
 
     let liq = 0;
     let vol24 = 0;
@@ -93,11 +142,12 @@ export default async function handler(req, res) {
       /* non-fatal */
     }
 
-    // record an hourly snapshot + compute 24h deltas (no-op until a KV is configured + ~24h warm-up)
-    const deltas = await recordAndDeltas({ price, liq, mcap: implied_mcap_usd, holders });
+    // record an hourly snapshot + compute 24h deltas (no-op until a KV is configured + ~24h warm-up).
+    // Degraded responses never enter the delta buckets — that's how a false -80%
+    // liquidity delta got published on 2026-07-13.
+    const deltas = degraded ? {} : await recordAndDeltas({ price, liq, mcap: implied_mcap_usd, holders });
 
-    return res.status(200).json(
-      envelope({
+    const payload = {
         liquidity_weighted_price_usd: price,
         price_change_h24: price_change_h24,
         total_pool_liquidity_usd: Math.round(liq * 100) / 100,
@@ -118,6 +168,17 @@ export default async function handler(req, res) {
           liquidityUsd: +p.liquidity.usd,
           cite: { type: 'account', ref: p.pairAddress }
         }))
+    };
+
+    if (!degraded) {
+      // remember this payload as last-good for the guard (best-effort)
+      await setLastGood({ as_of: new Date().toISOString(), data: payload });
+      return res.status(200).json(envelope(payload));
+    }
+    // degraded but no last-good baseline: publish live numbers, honestly flagged
+    return res.status(200).json(
+      envelope(payload, {
+        source: { live: 'dexscreener', degraded: true, served: 'live_partial', missing_pools: missingPools }
       })
     );
   } catch (e) {
