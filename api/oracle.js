@@ -13,6 +13,56 @@ const STATIC_BASE = (process.env.STATIC_BASE || 'https://explorer.mctoken.xyz/ap
 // (2026-07-13: DexScreener dropped the largest pool from responses to Vercel's egress.)
 const GUARD_MIN_LIQ_USD = Number(process.env.ORACLE_GUARD_MIN_LIQ_USD) || 1000;
 const GUARD_ENABLED = process.env.ORACLE_GUARD !== '0';
+// Second source (2026-09-23): when DexScreener omits a registry pool (it dropped the main
+// Meteora TOKE/SOL pool 6cVM… from its token endpoint), fetch just the missing pools from
+// GeckoTerminal and merge them in. Only if a pool is STILL missing is the response degraded.
+const BACKFILL_ENABLED = process.env.ORACLE_BACKFILL !== '0';
+// Staleness cap: last-good is served for at most this many hours; after that the live
+// (partial, flagged) numbers are published instead of freezing indefinitely.
+const LAST_GOOD_MAX_AGE_H = Number(process.env.ORACLE_LAST_GOOD_MAX_AGE_H) || 6;
+
+async function fetchJson(url, ms = 5000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, headers: { Accept: 'application/json' } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// GeckoTerminal pools → DexScreener-shaped pair objects (only the fields this handler reads).
+async function backfillFromGeckoTerminal(missing, registryByPair) {
+  if (!missing.length) return [];
+  const j = await fetchJson(
+    `https://api.geckoterminal.com/api/v2/networks/solana/pools/multi/${missing.join(',')}`
+  );
+  const out = [];
+  for (const d of Array.isArray(j?.data) ? j.data : []) {
+    const a = d?.attributes || {};
+    const addr = a.address;
+    const reg = registryByPair.get(addr);
+    const liq = Number(a.reserve_in_usd);
+    const px = Number(a.base_token_price_usd);
+    if (!reg || !(liq > 0) || !(px > 0)) continue;
+    const baseId = d?.relationships?.base_token?.data?.id || '';
+    const tokeIsBase = baseId === `solana_${MINT}`;
+    out.push({
+      pairAddress: addr,
+      dexId: reg.dex || 'unknown',
+      baseToken: tokeIsBase ? { address: MINT, symbol: 'TOKE' } : { address: baseId.replace(/^solana_/, ''), symbol: null },
+      quoteToken: { symbol: tokeIsBase ? reg.quote || null : 'TOKE' },
+      priceUsd: String(px),
+      liquidity: { usd: liq },
+      volume: { h24: Number(a?.volume_usd?.h24) || 0 },
+      priceChange: { h24: Number(a?.price_change_percentage?.h24) },
+      _source: 'geckoterminal'
+    });
+  }
+  return out;
+}
 
 export default async function handler(req, res) {
   res.setHeader('access-control-allow-origin', '*');
@@ -39,7 +89,7 @@ export default async function handler(req, res) {
     if (!r.ok) throw new Error(`DexScreener HTTP ${r.status}`);
     const j = await r.json();
 
-    const pairs = (j.pairs || [])
+    let pairs = (j.pairs || [])
       .filter((p) => p.liquidity && +p.liquidity.usd > 0)
       .sort((a, b) => +b.liquidity.usd - +a.liquidity.usd);
 
@@ -47,7 +97,6 @@ export default async function handler(req, res) {
     // quote-side pairs (e.g. DANK/TOKE) `priceUsd` is the BASE token's price, NOT TOKE's —
     // blending those into the VWAP silently skews the published TOKE price. Price therefore
     // uses base-side pairs only; liquidity + volume still sum across ALL pairs (ecosystem-wide).
-    const basePairs = pairs.filter((p) => p.baseToken && p.baseToken.address === MINT);
 
     // --- degraded-upstream guard -------------------------------------------
     // Cross-check the pair list against the canonical pool registry. If a major
@@ -55,24 +104,43 @@ export default async function handler(req, res) {
     // the last known-good payload (flagged) rather than skewed numbers, and do
     // NOT record the degraded values into the 24h delta buckets.
     let missingPools = [];
+    let backfilled = [];
     if (GUARD_ENABLED) {
+      let registry = [];
       try {
-        const pr = await fetch(`${STATIC_BASE}/pools.json`, { headers: { Accept: 'application/json' } });
-        if (pr.ok) {
-          const pj = await pr.json();
-          const registry = Array.isArray(pj?.data) ? pj.data : [];
-          const seen = new Set(pairs.map((p) => p.pairAddress));
-          missingPools = registry
-            .filter((p) => p && p.pair && Number(p.liquidity_usd) >= GUARD_MIN_LIQ_USD && !seen.has(p.pair))
-            .map((p) => p.pair);
-        }
+        const pj = await fetchJson(`${STATIC_BASE}/pools.json`);
+        registry = Array.isArray(pj?.data) ? pj.data : [];
       } catch {
         /* registry unreachable → guard can't judge; proceed live */
       }
+      const seen = new Set(pairs.map((p) => p.pairAddress));
+      missingPools = registry
+        .filter((p) => p && p.pair && Number(p.liquidity_usd) >= GUARD_MIN_LIQ_USD && !seen.has(p.pair))
+        .map((p) => p.pair);
+      if (missingPools.length > 0 && BACKFILL_ENABLED) {
+        try {
+          const extra = await backfillFromGeckoTerminal(missingPools, new Map(registry.map((p) => [p.pair, p])));
+          if (extra.length) {
+            backfilled = extra.map((p) => p.pairAddress);
+            pairs = pairs.concat(extra).sort((a, b) => +b.liquidity.usd - +a.liquidity.usd);
+            missingPools = missingPools.filter((a) => !backfilled.includes(a));
+          }
+        } catch {
+          /* second source down → fall through to the guard */
+        }
+      }
     }
+    const basePairs = pairs.filter((p) => p.baseToken && p.baseToken.address === MINT);
+    const liveSource = backfilled.length
+      ? { live: 'dexscreener', backfilled: { source: 'geckoterminal', pools: backfilled } }
+      : { live: 'dexscreener' };
+
+    let lastGoodExpired = false;
     if (missingPools.length > 0) {
       const lastGood = await getLastGood();
-      if (lastGood && lastGood.data) {
+      const ageH = lastGood?.as_of ? (Date.now() - Date.parse(lastGood.as_of)) / 36e5 : Infinity;
+      lastGoodExpired = !!(lastGood && lastGood.data) && !(ageH <= LAST_GOOD_MAX_AGE_H);
+      if (lastGood && lastGood.data && !lastGoodExpired) {
         // serve last-good, honestly labeled; envelope as_of stays "now",
         // data_as_of says how old the numbers actually are
         return res.status(200).json(
@@ -158,7 +226,7 @@ export default async function handler(req, res) {
         liquidity_change_pct_24h: deltas.liquidity_change_pct_24h ?? null,
         holders_change_24h: deltas.holders_change_24h ?? null,
         mcap_change_pct_24h: deltas.mcap_change_pct_24h ?? null,
-        method: 'live liquidity-weighted VWAP over TOKE-base pairs (DexScreener); liquidity/volume summed over all pairs; mcap = price × TOKE-API supply',
+        method: 'live liquidity-weighted VWAP over TOKE-base pairs (DexScreener; registry pools it omits are backfilled from GeckoTerminal); liquidity/volume summed over all pairs; mcap = price × TOKE-API supply',
         pools: pairs.map((p) => ({
           dex: p.dexId,
           base: p.baseToken && p.baseToken.symbol,
@@ -166,6 +234,7 @@ export default async function handler(req, res) {
           priceUsd: +p.priceUsd,
           in_vwap: !!(p.baseToken && p.baseToken.address === MINT),
           liquidityUsd: +p.liquidity.usd,
+          ...(p._source ? { source: p._source } : {}),
           cite: { type: 'account', ref: p.pairAddress }
         }))
     };
@@ -173,12 +242,18 @@ export default async function handler(req, res) {
     if (!degraded) {
       // remember this payload as last-good for the guard (best-effort)
       await setLastGood({ as_of: new Date().toISOString(), data: payload });
-      return res.status(200).json(envelope(payload));
+      return res.status(200).json(envelope(payload, { source: liveSource }));
     }
     // degraded but no last-good baseline: publish live numbers, honestly flagged
     return res.status(200).json(
       envelope(payload, {
-        source: { live: 'dexscreener', degraded: true, served: 'live_partial', missing_pools: missingPools }
+        source: {
+          ...liveSource,
+          degraded: true,
+          served: 'live_partial',
+          missing_pools: missingPools,
+          ...(lastGoodExpired ? { last_good_expired_after_h: LAST_GOOD_MAX_AGE_H } : {})
+        }
       })
     );
   } catch (e) {
